@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -13,6 +14,9 @@
 
     <!-- PapaParse for CSV -->
     <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+
+    <!-- PDF.js for reading PDF files -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 
     <style>
         :root {
@@ -470,6 +474,10 @@
             color: var(--accent);
         }
 
+        .log-source-pdf {
+            color: #8b5cf6;
+        }
+
         /* Guide */
         .guide {
             background: var(--bg-tertiary);
@@ -731,6 +739,20 @@
                         <button class="btn btn-primary" onclick="importCsv()">Import CSV</button>
                     </div>
                     <div id="importStatus"></div>
+                </div>
+
+                <!-- PDF Import -->
+                <div class="settings-section">
+                    <h3>Import Historical PDFs</h3>
+                    <p style="font-size: 13px; color: var(--text-secondary); margin-bottom: 12px;">
+                        Upload your Air-Vend sales report PDFs directly. Duplicates are automatically skipped.
+                    </p>
+                    <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                        <input type="file" id="pdfInput" accept=".pdf" multiple style="display: none;" onchange="handlePdfUpload(event)">
+                        <button class="btn btn-primary" onclick="document.getElementById('pdfInput').click()">Upload PDF(s)</button>
+                        <span id="pdfFileNames" style="font-size: 13px; color: var(--text-muted);"></span>
+                    </div>
+                    <div id="pdfStatus"></div>
                 </div>
 
                 <!-- Quick Actions -->
@@ -1201,7 +1223,9 @@
             }
 
             logEl.innerHTML = importLog.slice(-20).reverse().map(entry => {
-                const sourceClass = entry.source === 'sheet' ? 'log-source-sheet' : 'log-source-csv';
+                let sourceClass = 'log-source-csv';
+                if (entry.source === 'sheet') sourceClass = 'log-source-sheet';
+                else if (entry.source === 'pdf') sourceClass = 'log-source-pdf';
                 return `<div class="log-entry"><span class="${sourceClass}">[${entry.source.toUpperCase()}]</span> ${entry.message} - ${new Date(entry.timestamp).toLocaleString()}</div>`;
             }).join('');
         }
@@ -1403,6 +1427,180 @@
             });
 
             return { added, duplicates };
+        }
+
+        // ============================================================
+        // PDF IMPORT
+        // ============================================================
+        async function handlePdfUpload(event) {
+            const files = event.target.files;
+            if (!files || files.length === 0) return;
+
+            const fileNames = Array.from(files).map(f => f.name).join(', ');
+            document.getElementById('pdfFileNames').textContent = fileNames;
+            showStatus('pdfStatus', `Processing ${files.length} PDF(s)...`, 'info');
+
+            let totalAdded = 0;
+            let totalDuplicates = 0;
+            let totalErrors = 0;
+
+            for (const file of files) {
+                try {
+                    const result = await importPdf(file);
+                    totalAdded += result.added;
+                    totalDuplicates += result.duplicates;
+                } catch (err) {
+                    console.error('Error processing PDF:', file.name, err);
+                    totalErrors++;
+                }
+            }
+
+            saveToStorage();
+            updateUI();
+
+            let message = `Done! ${totalAdded} new records added, ${totalDuplicates} duplicates skipped.`;
+            if (totalErrors > 0) {
+                message += ` ${totalErrors} file(s) had errors.`;
+            }
+            message += ` Total records: ${salesData.length}`;
+
+            showStatus('pdfStatus', message, totalErrors > 0 ? 'warning' : 'success');
+
+            // Clear file input so same file can be uploaded again if needed
+            event.target.value = '';
+            document.getElementById('pdfFileNames').textContent = '';
+        }
+
+        async function importPdf(file) {
+            // Set the worker source for PDF.js
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+            // Read file as array buffer
+            const arrayBuffer = await file.arrayBuffer();
+
+            // Load the PDF
+            const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+
+            // Extract text from all pages
+            let fullText = '';
+            for (let i = 1; i <= pdf.numPages; i++) {
+                const page = await pdf.getPage(i);
+                const textContent = await page.getTextContent();
+                const pageText = textContent.items.map(item => item.str).join(' ');
+                fullText += pageText + '\n';
+            }
+
+            // Parse the extracted text
+            const records = parsePdfText(fullText);
+
+            // Use existing merge function for deduplication
+            return mergeData(records, 'pdf');
+        }
+
+        function parsePdfText(text) {
+            const records = [];
+
+            // Track current payment type as we scan through the text
+            let currentPaymentType = 'Unknown';
+
+            // Split into lines/chunks and look for payment type headers and sales entries
+            const lines = text.split(/\n/);
+
+            for (const line of lines) {
+                // Check for payment type headers
+                if (line.includes('Cash Sales')) {
+                    currentPaymentType = 'Cash Sales';
+                } else if (line.includes('Credit Card Sales')) {
+                    currentPaymentType = 'Credit Card Sales';
+                } else if (line.includes('Premium Sales')) {
+                    currentPaymentType = 'Premium Sales';
+                } else if (line.includes('Coupon Sales')) {
+                    currentPaymentType = 'Coupon Sales';
+                }
+            }
+
+            // Now extract all sales entries using regex
+            // Format: MM/DD/YYYY H:MM:SS AM/PM  Slot#  Item Name  Category  $Price
+            // The PDF text extraction joins things with spaces, so we need a flexible pattern
+            const salesPattern = /(\d{1,2}\/\d{1,2}\/\d{4})\s+(\d{1,2}:\d{2}:\d{2}\s+[AP]M)\s+(\d+)\s+(.+?)\s+\$([\d,.]+)/gi;
+
+            let match;
+            while ((match = salesPattern.exec(text)) !== null) {
+                const [, date, time, slot, itemAndCategory, priceStr] = match;
+
+                // The item name is mixed with category, we need to clean it up
+                // Category is usually the last word(s) like "Snacks", "Cold Beverages", etc.
+                // We'll keep the full text as the item name and let it include category
+                const item = itemAndCategory.trim();
+
+                // Parse price (remove commas if any)
+                const price = parseFloat(priceStr.replace(',', '')) || 0;
+
+                // Determine payment type based on position in text
+                // Find where this match is and what payment type was last seen before it
+                const matchPosition = match.index;
+                let paymentType = 'Unknown';
+
+                // Check each payment type header position
+                const cashPos = text.lastIndexOf('Cash Sales', matchPosition);
+                const creditPos = text.lastIndexOf('Credit Card Sales', matchPosition);
+                const premiumPos = text.lastIndexOf('Premium Sales', matchPosition);
+                const couponPos = text.lastIndexOf('Coupon Sales', matchPosition);
+
+                const positions = [
+                    { type: 'Cash Sales', pos: cashPos },
+                    { type: 'Credit Card Sales', pos: creditPos },
+                    { type: 'Premium Sales', pos: premiumPos },
+                    { type: 'Coupon Sales', pos: couponPos }
+                ].filter(p => p.pos >= 0);
+
+                if (positions.length > 0) {
+                    // Get the most recent payment type header
+                    positions.sort((a, b) => b.pos - a.pos);
+                    paymentType = positions[0].type;
+                }
+
+                records.push({
+                    date: date,
+                    time: time,
+                    slot: slot,
+                    item: cleanItemName(item),
+                    price: price,
+                    paymentType: paymentType,
+                    location: extractLocation(text),
+                    emailDate: date,
+                    source: 'pdf',
+                    key: `${date}|${time}|${cleanItemName(item)}|${price}`
+                });
+            }
+
+            return records;
+        }
+
+        function cleanItemName(rawItem) {
+            // Remove common category suffixes that get mixed in
+            const categories = ['Snacks', 'Cold Beverages', 'Hot Beverages', 'Candy', 'Chips', 'Cookies', 'Crackers', 'Pastry', 'Gum & Mints', 'Energy Drinks', 'Water', 'Soda', 'Juice'];
+
+            let item = rawItem.trim();
+
+            // Remove category if it's at the end
+            for (const cat of categories) {
+                if (item.endsWith(' ' + cat)) {
+                    item = item.slice(0, -(cat.length + 1)).trim();
+                    break;
+                }
+            }
+
+            return item;
+        }
+
+        function extractLocation(text) {
+            // Try to find "Sales for [Location]" pattern
+            const locationMatch = text.match(/Sales for\s+(.+?)(?:\s+Cash|\s+Credit|\s+Total|\n|$)/i);
+            if (locationMatch) {
+                return locationMatch[1].trim();
+            }
+            return '';
         }
 
         function loadSampleData() {
